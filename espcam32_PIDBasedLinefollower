@@ -1,11 +1,11 @@
 /*
  * ===========================================================
- *  ESP32-CAM VISION + PID CO-PROCESSOR (TESTING VERSION)
+ *  ESP32-CAM VISION + PID CO-PROCESSOR (PRODUCTION VERSION)
  *  Line-Follower Robot - Master/Slave Architecture
  * ===========================================================
  *  Role: Capture frames, crop ROI, binarize, filter, compute
- *        centroid error, run PID.
- *  DEBUG: Prints telemetry to Serial monitor for tuning.
+ *        centroid error, run PID, send steering vector u(t)
+ *        via UART0 (U0T) to Master ESP32.
  * ===========================================================
  */
 
@@ -208,7 +208,7 @@ void setup() {
 
   lastTime = millis();
   Serial.println("ESP32-CAM Vision/PID node ready.");
-  Serial.println(">>> ENTERING TEST/TUNING MODE <<<");
+  Serial.println(">>> RUNNING IN PRODUCTION MODE <<<");
 }
 
 // ===========================================================
@@ -240,29 +240,17 @@ void loop() {
   if (lineFound) {
     u = computePID(error, dt);
 
-    // ----------- TEST MODE OUTPUT -----------
-    Serial.print("[LINE FOUND] Error: ");
-    Serial.print(error);
-    Serial.print(" | PID output u(t): ");
-    Serial.println(u);
-    // ----------------------------------------
+
   } else {
     // Line lost: hold last commanded value but decay integral
     // to avoid runaway windup; send neutral-biased signal.
     integralError *= 0.95f;
     u = constrain(lastError > 0 ? U_MAX : U_MIN, U_MIN, U_MAX);
 
-    // ----------- TEST MODE OUTPUT -----------
-    Serial.println("[LINE LOST] Waiting for track...");
-    // ----------------------------------------
+
   }
 
   // --- Transmit to Master ---
-  // In test mode, we might comment this out to avoid sending packets
-  // into the serial monitor alongside the debug text, but if you want
-  // to run both, you can uncomment it.
-  // sendSteeringVector(u);
-
-  // Optional: add a small delay to make serial monitor readable
-  delay(50);
+  // Send the calculated steering command over serial
+  sendSteeringVector(u);
 }
