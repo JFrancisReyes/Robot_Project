@@ -1,0 +1,265 @@
+/*
+ * ===========================================================
+ *  ESP32-CAM VISION + PID CO-PROCESSOR (TESTING VERSION)
+ *  Line-Follower Robot - Master/Slave Architecture
+ * ===========================================================
+ *  Role: Capture frames, crop ROI, binarize, filter, compute
+ *        centroid error, run PID.
+ *  DEBUG: Prints telemetry to Serial monitor for tuning.
+ * ===========================================================
+ */
+
+#include "esp_camera.h"
+
+// ===========================================================
+//  >>> CALIBRATION SECTION (TUNE THESE FOR YOUR TRACK) <
+// ===========================================================
+
+// PID Gains
+float Kp = 0.8;
+float Ki = 0.02;
+float Kd = 0.15;
+
+// Binarization threshold (0-255). Pixels BELOW this = "black line"
+uint8_t BIN_THRESHOLD = 90;
+
+// ROI definition (lower third of QQVGA 160x120 frame)
+const int FRAME_W = 160;
+const int FRAME_H = 120;
+const int ROI_X = 70; // start column (crops 70px left & right, leaving a tight 20px center)
+const int ROI_Y = 100; // start row of ROI (pushed to the very bottom to look directly down)
+const int ROI_W = 20; // width of ROI (ultra-tight 20 pixels)
+const int ROI_H = 20; // height of ROI (reduced to avoid looking too far ahead)
+
+// PID output clamp (sent as steering bias)
+const float U_MIN = -100.0;
+const float U_MAX = 100.0;
+
+// ===========================================================
+//  AI-THINKER ESP32-CAM PIN MAP
+// ===========================================================
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+// Flashlight pin
+#define FLASH_LED_PIN 4
+
+// ===========================================================
+//  GLOBAL STATE
+// ===========================================================
+
+float integralError = 0.0;
+float lastError = 0.0;
+unsigned long lastTime = 0;
+
+// ===========================================================
+//  CAMERA INITIALIZATION
+// ===========================================================
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+
+  // Use GRAYSCALE directly to avoid manual RGB565 to Gray conversion
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size = FRAMESIZE_QQVGA;    // 160x120
+  config.fb_count = 1;                    // minimize PSRAM usage
+  config.fb_location = CAMERA_FB_IN_DRAM; // QQVGA fits in DRAM
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  return (err == ESP_OK);
+}
+
+// ===========================================================
+//  VISION PIPELINE: BINARIZE + MEDIAN FILTER + CENTROID
+// ===========================================================
+bool processVisionPipeline(camera_fb_t *fb, float &error) {
+  float weightedSumX = 0;
+  float totalWeight = 0;
+  uint8_t *pixels = fb->buf;
+
+  // Iterate over ROI, ignoring the 1-pixel border to allow 3x3 windowing
+  for (int y = 1; y < ROI_H - 1; y++) {
+    int srcRow = ROI_Y + y;
+    
+    // PERSPECTIVE CORRECTION: Pixels at the bottom of the image (higher y) 
+    // are physically closer to the robot. We square the weight to heavily 
+    // prioritize tracking the line immediately in front of the wheels, 
+    // while still letting it 'see' ahead slightly.
+    float rowWeight = (float)y / (float)ROI_H;
+    rowWeight = rowWeight * rowWeight; // Exponential emphasis on the bottom rows
+
+    for (int x = 1; x < ROI_W - 1; x++) {
+      int sum = 0;
+
+      // 3x3 Median filter on binarized data
+      for (int dy = -1; dy <= 1; dy++) {
+        int r = srcRow + dy;
+        for (int dx = -1; dx <= 1; dx++) {
+          // Binarize on the fly, adding ROI_X offset for cropped view
+          if (pixels[r * FRAME_W + ((ROI_X + x) + dx)] < BIN_THRESHOLD) {
+            sum++;
+          }
+        }
+      }
+
+      // If majority (5 or more out of 9) are black, median is black
+      if (sum >= 5) {
+        weightedSumX += (x * rowWeight);
+        totalWeight += rowWeight;
+      }
+    }
+  }
+
+  if (totalWeight == 0)
+    return false;
+
+  float centroidX = weightedSumX / totalWeight;
+  error = centroidX - (ROI_W / 2.0f);
+  return true;
+}
+
+// ===========================================================
+//  PID CONTROLLER
+// ===========================================================
+float computePID(float error, float dt) {
+  // Integral term (with simple anti-windup clamp)
+  integralError += error * dt;
+  integralError = constrain(integralError, -500.0f, 500.0f);
+
+  // Derivative term
+  float derivative = (dt > 0.0f) ? (error - lastError) / dt : 0.0f;
+
+  float u = Kp * error + Ki * integralError + Kd * derivative;
+  u = constrain(u, U_MIN, U_MAX);
+
+  lastError = error;
+  return u;
+}
+
+// ===========================================================
+//  TRANSMIT STEERING VECTOR TO MASTER ESP32
+// ===========================================================
+// Packet format: "<U:+012.345>\n"
+void sendSteeringVector(float u) {
+  char packet[24];
+  snprintf(packet, sizeof(packet), "<U:%+08.3f>\n", u);
+
+  // Send via UART0 (U0T). Connected to Master RX (P22)
+  Serial.print(packet);
+}
+
+// ===========================================================
+//  SETUP
+// ===========================================================
+void setup() {
+  // Use UART0 for transmission. This will go out through the U0T pin.
+  Serial.begin(115200);
+
+  if (!initCamera()) {
+    Serial.println("FATAL: Camera init failed.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // Turn on the Flashlight LED (GPIO 4) to improve line detection lighting
+  pinMode(FLASH_LED_PIN, OUTPUT);
+
+  // NOTE: digitalWrite sets it to max brightness which gets very hot.
+  // If it's too bright or gets too hot, use analogWrite(FLASH_LED_PIN, 10)
+  // instead.
+  analogWrite(FLASH_LED_PIN, 40);
+
+  lastTime = millis();
+  Serial.println("ESP32-CAM Vision/PID node ready.");
+  Serial.println(">>> ENTERING TEST/TUNING MODE <<<");
+}
+
+// ===========================================================
+//  MAIN LOOP
+// ===========================================================
+void loop() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Frame capture failed.");
+    return;
+  }
+
+  // --- Process Vision ---
+  float error;
+  bool lineFound = processVisionPipeline(fb, error);
+
+  esp_camera_fb_return(fb); // release frame buffer ASAP
+
+  // --- Timing for PID ---
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0f;
+  if (dt <= 0.0f)
+    dt = 0.001f;
+  lastTime = now;
+
+  // --- Error + PID ---
+  float u;
+
+  if (lineFound) {
+    u = computePID(error, dt);
+
+    // ----------- TEST MODE OUTPUT -----------
+    Serial.print("[LINE FOUND] Error: ");
+    Serial.print(error);
+    Serial.print(" | PID output u(t): ");
+    Serial.println(u);
+    // ----------------------------------------
+  } else {
+    // Line lost: hold last commanded value but decay integral
+    // to avoid runaway windup; send neutral-biased signal.
+    integralError *= 0.95f;
+    u = constrain(lastError > 0 ? U_MAX : U_MIN, U_MIN, U_MAX);
+
+    // ----------- TEST MODE OUTPUT -----------
+    Serial.println("[LINE LOST] Waiting for track...");
+    // ----------------------------------------
+  }
+
+  // --- Transmit to Master ---
+  // In test mode, we might comment this out to avoid sending packets
+  // into the serial monitor alongside the debug text, but if you want
+  // to run both, you can uncomment it.
+  // sendSteeringVector(u);
+
+  // Optional: add a small delay to make serial monitor readable
+  delay(50);
+}

@@ -1,0 +1,188 @@
+/*
+ * ===========================================================
+ *  MASTER ESP32 (ESP32-D0WD-V3) - MOTOR ACTUATION CONTROLLER
+ *  Line-Follower Robot - Master/Slave Architecture
+ * ===========================================================
+ *  Role: Receive steering vector u(t) from ESP32-CAM over
+ *        UART, map to differential PWM signals, and drive
+ *        the A4950 dual H-bridge controlling 2x JGA 188RPM
+ *        DC motors.
+ *
+ *  NOTE: Uses the new LEDC API (ESP32 Arduino Core 3.x):
+ *        ledcAttach(pin, freq, resolution) / ledcWrite(pin, duty)
+ * ===========================================================
+ */
+
+#include <HardwareSerial.h>
+
+// ===========================================================
+//  CONFIGURATION
+// ===========================================================
+
+// UART connection from ESP32-CAM (CAM TX -> Master RX)
+#define CAM_UART_RX_PIN 22 // Connected to CAM UOT (TX)
+#define CAM_UART_TX_PIN 17 // Connected to CAM UOR (RX)
+#define UART_BAUD 115200
+
+// A4950 Motor Driver Pins
+// Each motor channel uses two PWM inputs (IN1/IN2-style):
+// Direction is set by which pin carries the PWM duty.
+#define LEFT_MOTOR_IN1 25
+#define LEFT_MOTOR_IN2 26
+#define RIGHT_MOTOR_IN1 27
+#define RIGHT_MOTOR_IN2 14
+
+// LEDC PWM configuration
+#define PWM_FREQ 5000    // 5 kHz, above audible range
+#define PWM_RESOLUTION 8 // 8-bit duty (0-255)
+
+// Base speed (forward throttle) and steering scaling
+const int BASE_SPEED = 150;    // 0-255
+const float STEER_SCALE = 1.0; // multiplier applied to u(t)
+const int MAX_PWM = 255;
+
+// Failsafe: if no valid packet received within this window,
+// stop motors (prevents runaway on lost link).
+const unsigned long LINK_TIMEOUT_MS = 500;
+
+// ===========================================================
+//  GLOBAL STATE
+// ===========================================================
+HardwareSerial CamLink(2); // UART2
+
+String rxBuffer = "";
+float steeringU = 0.0;
+unsigned long lastPacketTime = 0;
+
+// ===========================================================
+//  PWM SETUP (NEW LEDC API - ESP32 CORE 3.x)
+// ===========================================================
+void setupPWM() {
+  ledcAttach(LEFT_MOTOR_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(LEFT_MOTOR_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(RIGHT_MOTOR_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(RIGHT_MOTOR_IN2, PWM_FREQ, PWM_RESOLUTION);
+
+  // Ensure motors start stopped
+  ledcWrite(LEFT_MOTOR_IN1, 0);
+  ledcWrite(LEFT_MOTOR_IN2, 0);
+  ledcWrite(RIGHT_MOTOR_IN1, 0);
+  ledcWrite(RIGHT_MOTOR_IN2, 0);
+}
+
+// ===========================================================
+//  MOTOR DRIVE HELPER (A4950)
+// ===========================================================
+// A4950 logic: drive IN1 with PWM for forward, IN2 = 0.
+// For reverse, drive IN2 with PWM, IN1 = 0.
+// speed range: -255 (full reverse) .. +255 (full forward)
+void driveMotor(int in1Pin, int in2Pin, int speed) {
+  speed = constrain(speed, -MAX_PWM, MAX_PWM);
+
+  if (speed >= 0) {
+    ledcWrite(in1Pin, speed);
+    ledcWrite(in2Pin, 0);
+  } else {
+    ledcWrite(in1Pin, 0);
+    ledcWrite(in2Pin, -speed);
+  }
+}
+
+void stopMotors() {
+  driveMotor(LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, 0);
+  driveMotor(RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, 0);
+}
+
+// ===========================================================
+//  APPLY DIFFERENTIAL STEERING
+// ===========================================================
+// u > 0 -> line is to the right -> robot must turn right
+//          -> increase left motor speed, decrease right motor speed
+// u < 0 -> line is to the left  -> turn left
+void applySteering(float u) {
+  float steer = u * STEER_SCALE;
+
+  int leftSpeed = (int)(BASE_SPEED + steer);
+  int rightSpeed = (int)(BASE_SPEED - steer);
+
+  leftSpeed = constrain(leftSpeed, -MAX_PWM, MAX_PWM);
+  rightSpeed = constrain(rightSpeed, -MAX_PWM, MAX_PWM);
+
+  driveMotor(LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, leftSpeed);
+  driveMotor(RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, rightSpeed);
+}
+
+// ===========================================================
+//  NON-BLOCKING UART PACKET PARSER
+// ===========================================================
+// Expected packet format from ESP32-CAM: "<U:+012.345>\n"
+// Parses incoming bytes incrementally without blocking.
+void parseIncomingSerial() {
+  while (CamLink.available() > 0) {
+    char c = (char)CamLink.read();
+
+    if (c == '<') {
+      rxBuffer = ""; // start of new packet
+      rxBuffer += c;
+    } else if (c == '>') {
+      rxBuffer += c;
+      processPacket(rxBuffer); // complete packet received
+      rxBuffer = "";
+    } else if (c == '\n' || c == '\r') {
+      // ignore line terminators
+    } else {
+      rxBuffer += c;
+      // Safety: prevent unbounded buffer growth on garbled data
+      if (rxBuffer.length() > 32) {
+        rxBuffer = "";
+      }
+    }
+  }
+}
+
+// Parses a complete "<U:+012.345>" packet and updates steeringU.
+void processPacket(const String &packet) {
+  // Validate format: must start with "<U:" and end with ">"
+  if (packet.length() < 5)
+    return;
+  if (packet.charAt(0) != '<')
+    return;
+  if (packet.charAt(packet.length() - 1) != '>')
+    return;
+  if (packet.charAt(1) != 'U' || packet.charAt(2) != ':')
+    return;
+
+  String valueStr = packet.substring(3, packet.length() - 1);
+  float value = valueStr.toFloat();
+
+  steeringU = value;
+  lastPacketTime = millis();
+}
+
+// ===========================================================
+//  SETUP
+// ===========================================================
+void setup() {
+  Serial.begin(115200);
+  CamLink.begin(UART_BAUD, SERIAL_8N1, CAM_UART_RX_PIN, CAM_UART_TX_PIN);
+
+  setupPWM();
+  stopMotors();
+
+  lastPacketTime = millis();
+  Serial.println("Master ESP32 motor controller ready.");
+}
+
+// ===========================================================
+//  MAIN LOOP - NON-BLOCKING
+// ===========================================================
+void loop() {
+  parseIncomingSerial();
+
+  // Failsafe: stop if link is stale
+  if (millis() - lastPacketTime > LINK_TIMEOUT_MS) {
+    stopMotors();
+  } else {
+    applySteering(steeringU);
+  }
+}
