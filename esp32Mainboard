@@ -1,48 +1,53 @@
 /*
  * ===========================================================
- *  MASTER ESP32 (ESP32-D0WD-V3) - MOTOR ACTUATION CONTROLLER
- *  Line-Follower Robot - Master/Slave Architecture
- * ===========================================================
- *  Role: Receive steering vector u(t) from ESP32-CAM over
- *        UART, map to differential PWM signals, and drive
- *        the A4950 dual H-bridge controlling 2x JGA 188RPM
- *        DC motors.
- *
- *  NOTE: Uses the new LEDC API (ESP32 Arduino Core 3.x):
- *        ledcAttach(pin, freq, resolution) / ledcWrite(pin, duty)
+ *  MASTER ESP32 - MOTOR ACTUATION & LOGIC CONTROLLER
+ *  Multi-Mode: AgiBot (Line Follower) / Sumobot
  * ===========================================================
  */
 
 #include <HardwareSerial.h>
 
 // ===========================================================
-//  CONFIGURATION
+//  CONFIGURATION & PIN DEFINITIONS
 // ===========================================================
 
-// UART connection from ESP32-CAM (CAM TX -> Master RX)
+// UART connection from ESP32-CAM (Master RX=22, TX=17)
 #define CAM_UART_RX_PIN 22 // Connected to CAM UOT (TX)
 #define CAM_UART_TX_PIN 17 // Connected to CAM UOR (RX)
 #define UART_BAUD 115200
 
 // A4950 Motor Driver Pins
-// Each motor channel uses two PWM inputs (IN1/IN2-style):
-// Direction is set by which pin carries the PWM duty.
-#define LEFT_MOTOR_IN1 25
-#define LEFT_MOTOR_IN2 26
-#define RIGHT_MOTOR_IN1 27
-#define RIGHT_MOTOR_IN2 14
+#define MOTOR_A_IN1 26 // AIN1
+#define MOTOR_A_IN2 25 // AIN2
+#define MOTOR_B_IN1 27 // BIN1
+#define MOTOR_B_IN2 16 // BIN2
+
+// Downward Facing IR Sensors (TRCT 5000)
+#define IR_DOWN_FL 18
+#define IR_DOWN_FR 19
+#define IR_DOWN_BL 4
+#define IR_DOWN_BR 5
+
+// Front Facing Sensors
+#define SENS_CENTER_E18 35
+#define SENS_LEFT_SHARP 32
+#define SENS_RIGHT_SHARP 33
+
+// DIP Switches
+#define DIP_SW1 21
+#define DIP_SW2 14
+#define DIP_SW3 12
+#define DIP_SW4 13 // Safety switch
 
 // LEDC PWM configuration
-#define PWM_FREQ 5000    // 5 kHz, above audible range
+#define PWM_FREQ 5000    // 5 kHz
 #define PWM_RESOLUTION 8 // 8-bit duty (0-255)
 
-// Base speed (forward throttle) and steering scaling
-const int BASE_SPEED = 150;    // 0-255
-const float STEER_SCALE = 1.0; // multiplier applied to u(t)
-const int MAX_PWM = 255;
+// Base speed and max speed (limited to 80% of 255 = ~204)
+const int BASE_SPEED = 120;
+const float STEER_SCALE = 1.0; 
+const int MAX_PWM = 204;
 
-// Failsafe: if no valid packet received within this window,
-// stop motors (prevents runaway on lost link).
 const unsigned long LINK_TIMEOUT_MS = 500;
 
 // ===========================================================
@@ -54,28 +59,55 @@ String rxBuffer = "";
 float steeringU = 0.0;
 unsigned long lastPacketTime = 0;
 
+enum RobotMode {
+  MODE_IDLE,
+  MODE_WAITING_AGIBOT,
+  MODE_WAITING_SUMOBOT,
+  MODE_AGIBOT,
+  MODE_SUMOBOT_START,
+  MODE_SUMOBOT
+};
+
+RobotMode currentMode = MODE_IDLE;
+unsigned long stateStartTime = 0;
+
 // ===========================================================
-//  PWM SETUP (NEW LEDC API - ESP32 CORE 3.x)
+//  SETUP FUNCTIONS
 // ===========================================================
 void setupPWM() {
-  ledcAttach(LEFT_MOTOR_IN1, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(LEFT_MOTOR_IN2, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(RIGHT_MOTOR_IN1, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(RIGHT_MOTOR_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOTOR_A_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOTOR_A_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOTOR_B_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOTOR_B_IN2, PWM_FREQ, PWM_RESOLUTION);
 
   // Ensure motors start stopped
-  ledcWrite(LEFT_MOTOR_IN1, 0);
-  ledcWrite(LEFT_MOTOR_IN2, 0);
-  ledcWrite(RIGHT_MOTOR_IN1, 0);
-  ledcWrite(RIGHT_MOTOR_IN2, 0);
+  ledcWrite(MOTOR_A_IN1, 0);
+  ledcWrite(MOTOR_A_IN2, 0);
+  ledcWrite(MOTOR_B_IN1, 0);
+  ledcWrite(MOTOR_B_IN2, 0);
+}
+
+void setupPins() {
+  // Sensors
+  pinMode(IR_DOWN_FL, INPUT);
+  pinMode(IR_DOWN_FR, INPUT);
+  pinMode(IR_DOWN_BL, INPUT);
+  pinMode(IR_DOWN_BR, INPUT);
+  
+  pinMode(SENS_CENTER_E18, INPUT);
+  pinMode(SENS_LEFT_SHARP, INPUT);
+  pinMode(SENS_RIGHT_SHARP, INPUT);
+
+  // DIP Switches
+  pinMode(DIP_SW1, INPUT);
+  pinMode(DIP_SW2, INPUT);
+  pinMode(DIP_SW3, INPUT);
+  pinMode(DIP_SW4, INPUT);
 }
 
 // ===========================================================
 //  MOTOR DRIVE HELPER (A4950)
 // ===========================================================
-// A4950 logic: drive IN1 with PWM for forward, IN2 = 0.
-// For reverse, drive IN2 with PWM, IN1 = 0.
-// speed range: -255 (full reverse) .. +255 (full forward)
 void driveMotor(int in1Pin, int in2Pin, int speed) {
   speed = constrain(speed, -MAX_PWM, MAX_PWM);
 
@@ -89,16 +121,19 @@ void driveMotor(int in1Pin, int in2Pin, int speed) {
 }
 
 void stopMotors() {
-  driveMotor(LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, 0);
-  driveMotor(RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, 0);
+  driveMotor(MOTOR_A_IN1, MOTOR_A_IN2, 0);
+  driveMotor(MOTOR_B_IN1, MOTOR_B_IN2, 0);
+}
+
+// Drive both motors forward
+void driveForward(int speed) {
+  driveMotor(MOTOR_A_IN1, MOTOR_A_IN2, speed);
+  driveMotor(MOTOR_B_IN1, MOTOR_B_IN2, speed);
 }
 
 // ===========================================================
-//  APPLY DIFFERENTIAL STEERING
+//  APPLY DIFFERENTIAL STEERING (AGIBOT)
 // ===========================================================
-// u > 0 -> line is to the right -> robot must turn right
-//          -> increase left motor speed, decrease right motor speed
-// u < 0 -> line is to the left  -> turn left
 void applySteering(float u) {
   float steer = u * STEER_SCALE;
 
@@ -108,15 +143,25 @@ void applySteering(float u) {
   leftSpeed = constrain(leftSpeed, -MAX_PWM, MAX_PWM);
   rightSpeed = constrain(rightSpeed, -MAX_PWM, MAX_PWM);
 
-  driveMotor(LEFT_MOTOR_IN1, LEFT_MOTOR_IN2, leftSpeed);
-  driveMotor(RIGHT_MOTOR_IN1, RIGHT_MOTOR_IN2, rightSpeed);
+  // Assuming Motor A is Left and Motor B is Right
+  driveMotor(MOTOR_A_IN1, MOTOR_A_IN2, leftSpeed);
+  driveMotor(MOTOR_B_IN1, MOTOR_B_IN2, rightSpeed);
 }
 
 // ===========================================================
 //  NON-BLOCKING UART PACKET PARSER
 // ===========================================================
-// Expected packet format from ESP32-CAM: "<U:+012.345>\n"
-// Parses incoming bytes incrementally without blocking.
+void processPacket(const String &packet) {
+  if (packet.length() < 5) return;
+  if (packet.charAt(0) != '<') return;
+  if (packet.charAt(packet.length() - 1) != '>') return;
+  if (packet.charAt(1) != 'U' || packet.charAt(2) != ':') return;
+
+  String valueStr = packet.substring(3, packet.length() - 1);
+  steeringU = valueStr.toFloat();
+  lastPacketTime = millis();
+}
+
 void parseIncomingSerial() {
   while (CamLink.available() > 0) {
     char c = (char)CamLink.read();
@@ -126,13 +171,12 @@ void parseIncomingSerial() {
       rxBuffer += c;
     } else if (c == '>') {
       rxBuffer += c;
-      processPacket(rxBuffer); // complete packet received
+      processPacket(rxBuffer); 
       rxBuffer = "";
     } else if (c == '\n' || c == '\r') {
-      // ignore line terminators
+      // ignore
     } else {
       rxBuffer += c;
-      // Safety: prevent unbounded buffer growth on garbled data
       if (rxBuffer.length() > 32) {
         rxBuffer = "";
       }
@@ -140,23 +184,18 @@ void parseIncomingSerial() {
   }
 }
 
-// Parses a complete "<U:+012.345>" packet and updates steeringU.
-void processPacket(const String &packet) {
-  // Validate format: must start with "<U:" and end with ">"
-  if (packet.length() < 5)
-    return;
-  if (packet.charAt(0) != '<')
-    return;
-  if (packet.charAt(packet.length() - 1) != '>')
-    return;
-  if (packet.charAt(1) != 'U' || packet.charAt(2) != ':')
-    return;
-
-  String valueStr = packet.substring(3, packet.length() - 1);
-  float value = valueStr.toFloat();
-
-  steeringU = value;
-  lastPacketTime = millis();
+// ===========================================================
+//  SUMOBOT LOGIC FRAMEWORK
+// ===========================================================
+void sumoLogic() {
+  // Read sensors
+  // bool centerDetect = (digitalRead(SENS_CENTER_E18) == LOW); 
+  // bool leftDetect = (digitalRead(SENS_LEFT_SHARP) == LOW);
+  // bool rightDetect = (digitalRead(SENS_RIGHT_SHARP) == LOW);
+  
+  // Implement basic sumo hunting/attacking behavior here
+  // For now, just stop or perform a slow search
+  stopMotors(); 
 }
 
 // ===========================================================
@@ -166,23 +205,102 @@ void setup() {
   Serial.begin(115200);
   CamLink.begin(UART_BAUD, SERIAL_8N1, CAM_UART_RX_PIN, CAM_UART_TX_PIN);
 
+  setupPins();
   setupPWM();
   stopMotors();
 
   lastPacketTime = millis();
-  Serial.println("Master ESP32 motor controller ready.");
+  Serial.println("Master ESP32 controller ready.");
 }
 
 // ===========================================================
-//  MAIN LOOP - NON-BLOCKING
+//  MAIN LOOP
 // ===========================================================
 void loop() {
+  // Always parse incoming serial to clear buffer
   parseIncomingSerial();
 
-  // Failsafe: stop if link is stale
-  if (millis() - lastPacketTime > LINK_TIMEOUT_MS) {
-    stopMotors();
+  bool sw1 = digitalRead(DIP_SW1);
+  bool sw2 = digitalRead(DIP_SW2);
+  bool sw4 = digitalRead(DIP_SW4);
+
+  // Safety switch check
+  if (!sw4) {
+    if (currentMode != MODE_IDLE) {
+      Serial.println("Safety Switch OFF. Entering IDLE mode.");
+      currentMode = MODE_IDLE;
+      stopMotors();
+    }
   } else {
-    applySteering(steeringU);
+    // Mode Selection Logic
+    if (sw1 && !sw2) {
+      if (currentMode != MODE_AGIBOT && currentMode != MODE_WAITING_AGIBOT) {
+        Serial.println("Switching to AgiBot Mode (10s Wait)...");
+        currentMode = MODE_WAITING_AGIBOT;
+        stateStartTime = millis();
+        stopMotors();
+      }
+    } else if (!sw1 && sw2) {
+      if (currentMode != MODE_SUMOBOT && currentMode != MODE_WAITING_SUMOBOT && currentMode != MODE_SUMOBOT_START) {
+        Serial.println("Switching to Sumobot Mode (10s Wait)...");
+        currentMode = MODE_WAITING_SUMOBOT;
+        stateStartTime = millis();
+        stopMotors();
+      }
+    } else {
+      if (currentMode != MODE_IDLE) {
+        Serial.println("No valid mode selected. Entering IDLE mode.");
+        currentMode = MODE_IDLE;
+        stopMotors();
+      }
+    }
+  }
+
+  // State Machine Execution
+  unsigned long currentTime = millis();
+
+  switch (currentMode) {
+    case MODE_IDLE:
+      stopMotors();
+      break;
+
+    case MODE_WAITING_AGIBOT:
+      if (currentTime - stateStartTime >= 10000) {
+        Serial.println("AgiBot Mode Active!");
+        currentMode = MODE_AGIBOT;
+        CamLink.println("<L:1>"); // Turn on ESP32Cam light
+      }
+      break;
+
+    case MODE_AGIBOT:
+      if (currentTime - lastPacketTime > LINK_TIMEOUT_MS) {
+        stopMotors(); // Failsafe
+      } else {
+        applySteering(steeringU);
+      }
+      break;
+
+    case MODE_WAITING_SUMOBOT:
+      if (currentTime - stateStartTime >= 10000) {
+        Serial.println("Sumobot Mode: Starting initial forward dash!");
+        currentMode = MODE_SUMOBOT_START;
+        stateStartTime = currentTime;
+        driveForward(MAX_PWM); // Dash forward at max allowed speed
+      }
+      break;
+
+    case MODE_SUMOBOT_START:
+      if (currentTime - stateStartTime >= 3000) {
+        Serial.println("Sumobot Mode Active!");
+        currentMode = MODE_SUMOBOT;
+        stopMotors();
+      } else {
+        driveForward(MAX_PWM);
+      }
+      break;
+
+    case MODE_SUMOBOT:
+      sumoLogic();
+      break;
   }
 }
