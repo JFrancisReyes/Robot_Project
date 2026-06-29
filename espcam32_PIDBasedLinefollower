@@ -64,6 +64,7 @@ const float U_MAX = 100.0;
 //  GLOBAL STATE
 // ===========================================================
 
+String rxBuffer = "";
 float integralError = 0.0;
 float lastError = 0.0;
 unsigned long lastTime = 0;
@@ -192,32 +193,52 @@ void setup() {
   Serial.begin(115200);
 
   if (!initCamera()) {
-    Serial.println("FATAL: Camera init failed.");
+    // Serial.println("FATAL: Camera init failed.");
     while (true) {
       delay(1000);
     }
   }
 
-  // Turn on the Flashlight LED (GPIO 4) to improve line detection lighting
+  // Set up the Flashlight LED (GPIO 4)
   pinMode(FLASH_LED_PIN, OUTPUT);
 
-  // NOTE: digitalWrite sets it to max brightness which gets very hot.
-  // If it's too bright or gets too hot, use analogWrite(FLASH_LED_PIN, 10)
-  // instead.
-  analogWrite(FLASH_LED_PIN, 40);
+  // Start with the LED off, wait for Mainboard command <L:1>
+  analogWrite(FLASH_LED_PIN, 0);
 
   lastTime = millis();
-  Serial.println("ESP32-CAM Vision/PID node ready.");
-  Serial.println(">>> RUNNING IN PRODUCTION MODE <<<");
+  // Serial.println("ESP32-CAM Vision/PID node ready.");
+  // Serial.println(">>> RUNNING IN PRODUCTION MODE <<<");
 }
 
 // ===========================================================
 //  MAIN LOOP
 // ===========================================================
 void loop() {
+  // --- Check for incoming commands from Mainboard ---
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '<') {
+      rxBuffer = "";
+      rxBuffer += c;
+    } else if (c == '>') {
+      rxBuffer += c;
+      if (rxBuffer == "<L:1>") {
+        analogWrite(FLASH_LED_PIN, 40); // Turn light on
+      } else if (rxBuffer == "<L:0>") {
+        analogWrite(FLASH_LED_PIN, 0);  // Turn light off
+      }
+      rxBuffer = "";
+    } else if (c != '\n' && c != '\r') {
+      rxBuffer += c;
+      if (rxBuffer.length() > 16) { // Reset on malformed/long data
+        rxBuffer = "";
+      }
+    }
+  }
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("Frame capture failed.");
+    // Serial.println("Frame capture failed.");
     return;
   }
 
